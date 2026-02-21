@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build:
@@ -36,9 +37,16 @@ jobs:
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
       - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          registry-url: "https://registry.npmjs.org"
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -60,25 +68,22 @@ jobs:
 
       - name: Publish platform packages
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
           for pkg in darwin-arm64 linux-x64 linux-arm64; do
             cp "artifacts/headless-aws-sso-${pkg}/headless-aws-sso" "npm/${pkg}/headless-aws-sso"
             chmod +x "npm/${pkg}/headless-aws-sso"
             cd "npm/${pkg}"
             npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
-            npm publish --access public
+            npm publish --provenance --access public
             cd ../..
           done
 
       - name: Publish main package
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
           version="${{ steps.version.outputs.version }}"
-          # Update optionalDependencies versions to match
           bun -e "
             const pkg = JSON.parse(await Bun.file('package.json').text());
             pkg.version = '${version}';
@@ -87,4 +92,4 @@ jobs:
             }
             await Bun.write('package.json', JSON.stringify(pkg, null, 2) + '\n');
           "
-          npm publish --access public
+          npm publish --provenance --access public
