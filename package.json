@@ -1,0 +1,41 @@
+{
+  "name": "headless-aws-sso",
+  "version": "0.1.0",
+  "description": "Headless AWS SSO login with 1Password MFA automation",
+  "license": "MIT",
+  "module": "index.ts",
+  "type": "module",
+  "bin": {
+    "headless-aws-sso": "bin/headless-aws-sso"
+  },
+  "files": [
+    "bin/",
+    "index.ts",
+    "build.ts",
+    "tsconfig.json",
+    ".env.example",
+    "README.md"
+  ],
+  "optionalDependencies": {
+    "@headless-aws-sso/darwin-arm64": "0.1.0",
+    "@headless-aws-sso/linux-x64": "0.1.0",
+    "@headless-aws-sso/linux-arm64": "0.1.0"
+  },
+  "scripts": {
+    "login": "bun run index.ts",
+    "check": "bunx tsc --noEmit",
+    "build": "bun run build.ts",
+    "build:darwin-arm64": "bun build --compile --minify --sourcemap --target=bun-darwin-arm64 ./index.ts --outfile dist/headless-aws-sso-darwin-arm64",
+    "build:linux-x64": "bun build --compile --minify --sourcemap --target=bun-linux-x64 ./index.ts --outfile dist/headless-aws-sso-linux-x64",
+    "build:linux-arm64": "bun build --compile --minify --sourcemap --target=bun-linux-arm64 ./index.ts --outfile dist/headless-aws-sso-linux-arm64"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "playwright": "^1.58.2"
+  }
+}

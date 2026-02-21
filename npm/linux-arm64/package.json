@@ -1,0 +1,9 @@
+{
+  "name": "@headless-aws-sso/linux-arm64",
+  "version": "0.1.0",
+  "description": "headless-aws-sso binary for Linux ARM64",
+  "license": "MIT",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "files": ["headless-aws-sso"]
+}

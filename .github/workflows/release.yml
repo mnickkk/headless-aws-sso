@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: bun-darwin-arm64
+            os: macos-latest
+            pkg: darwin-arm64
+          - target: bun-linux-x64
+            os: ubuntu-latest
+            pkg: linux-x64
+          - target: bun-linux-arm64
+            os: ubuntu-latest
+            pkg: linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install
+      - name: Build binary
+        run: bun run build.ts --target ${{ matrix.target }} --outfile headless-aws-sso
+      - uses: actions/upload-artifact@v4
+        with:
+          name: headless-aws-sso-${{ matrix.pkg }}
+          path: headless-aws-sso
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          for dir in artifacts/headless-aws-sso-*/; do
+            pkg=$(basename "$dir" | sed 's/headless-aws-sso-//')
+            cp "$dir/headless-aws-sso" "headless-aws-sso-${pkg}"
+          done
+          gh release create "$tag" headless-aws-sso-* --generate-notes
+
+      - name: Set version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish platform packages
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          for pkg in darwin-arm64 linux-x64 linux-arm64; do
+            cp "artifacts/headless-aws-sso-${pkg}/headless-aws-sso" "npm/${pkg}/headless-aws-sso"
+            chmod +x "npm/${pkg}/headless-aws-sso"
+            cd "npm/${pkg}"
+            npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
+            npm publish --access public
+            cd ../..
+          done
+
+      - name: Publish main package
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > ~/.npmrc
+          version="${{ steps.version.outputs.version }}"
+          # Update optionalDependencies versions to match
+          bun -e "
+            const pkg = JSON.parse(await Bun.file('package.json').text());
+            pkg.version = '${version}';
+            for (const dep of Object.keys(pkg.optionalDependencies || {})) {
+              pkg.optionalDependencies[dep] = '${version}';
+            }
+            await Bun.write('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          npm publish --access public
