@@ -77,7 +77,7 @@ Options are resolved in order: defaults → environment variables → CLI argume
 | CLI flag | Env var | Description | Required |
 |---|---|---|---|
 | `--profile <name>` | `AWS_SSO_PROFILE` | AWS profile to export credentials for | Yes |
-| `--sso-session <name>` | `AWS_SSO_SESSION` | AWS SSO session name (from `~/.aws/config`) | Yes |
+| `--sso-session <name\|url>` | `AWS_SSO_SESSION` | AWS SSO session name or start URL | Yes |
 | `--op-item <id>` | `OP_ITEM` | 1Password item name or ID (Mode 1) | One of these |
 | `--op-share-link <url>` | `OP_SHARE_LINK` | 1Password share link URL (Mode 2) | two required |
 | `--sso-region <region>` | `AWS_SSO_REGION` | SSO region (default: `us-east-1`) | No |

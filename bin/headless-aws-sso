@@ -1,35 +1,18 @@
-#!/usr/bin/env node
-const { execFileSync } = require("child_process");
-const path = require("path");
+#!/usr/bin/env bun
+import { execFileSync } from "child_process";
+import path from "path";
+import { fileURLToPath } from "url";
 
-const PLATFORMS = {
-  "darwin-arm64": "@headless-aws-sso/darwin-arm64",
-  "linux-x64": "@headless-aws-sso/linux-x64",
-  "linux-arm64": "@headless-aws-sso/linux-arm64",
-};
-
-const key = `${process.platform}-${process.arch}`;
-const pkg = PLATFORMS[key];
-if (!pkg) {
-  console.error(`Unsupported platform: ${key}`);
-  process.exit(1);
-}
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const indexTs = path.join(__dirname, "..", "index.ts");
 
 try {
-  const binPath = path.join(
-    require.resolve(`${pkg}/package.json`),
-    "..",
-    "headless-aws-sso"
-  );
-  execFileSync(binPath, process.argv.slice(2), { stdio: "inherit" });
+  execFileSync("bun", ["run", indexTs, ...process.argv.slice(2)], {
+    stdio: "inherit",
+  });
 } catch (e) {
   if (e && e.status != null) {
-    // Binary ran but exited with non-zero — forward the exit code
     process.exit(e.status);
   }
-  console.error(
-    `Failed to run headless-aws-sso for ${key}. Is the package installed?`
-  );
-  console.error(`Try: npm install ${pkg}`);
   process.exit(1);
 }

@@ -91,6 +91,53 @@ function resolveEnvVars(defaults: Options): Options {
   return opts
 }
 
+async function resolveSsoSession(opts: Options): Promise<Options> {
+  if (!opts.ssoSession) return opts
+
+  // If it's not a URL, it's already a session name
+  if (!opts.ssoSession.startsWith('https://')) return opts
+
+  // Extract hostname from the provided URL for matching
+  const inputOrigin = new URL(opts.ssoSession).origin
+
+  const configPath = `${process.env.HOME}/.aws/config`
+  const configText = await Bun.file(configPath).text().catch(() => '')
+  if (!configText) {
+    throw new Error(`Cannot read ${configPath} to resolve SSO session from URL`)
+  }
+
+  // Parse ini-style config looking for [sso-session X] sections with matching sso_start_url origin
+  let currentSession: string | null = null
+  for (const line of configText.split('\n')) {
+    const trimmed = line.trim()
+    const sectionMatch = trimmed.match(/^\[sso-session\s+(.+)]$/)
+    if (sectionMatch) {
+      currentSession = sectionMatch[1]!
+      continue
+    }
+    if (currentSession && trimmed.startsWith('sso_start_url')) {
+      const value = trimmed.split('=', 2)[1]?.trim()
+      if (value) {
+        try {
+          const configOrigin = new URL(value).origin
+          if (configOrigin === inputOrigin) {
+            process.stderr.write(`[config] resolved URL to sso-session: ${currentSession}\n`)
+            return { ...opts, ssoSession: currentSession }
+          }
+        } catch {}
+      }
+    }
+    if (trimmed.startsWith('[')) {
+      currentSession = null
+    }
+  }
+
+  throw new Error(
+    `No sso-session found in ${configPath} with sso_start_url matching ${inputOrigin}\n` +
+    `Run 'aws configure sso' first to set up your SSO session.`,
+  )
+}
+
 function validateOptions(opts: Options): void {
   const errors: string[] = []
 
@@ -116,6 +163,7 @@ function validateOptions(opts: Options): void {
 }
 
 async function main(opts: Options): Promise<void> {
+  opts = await resolveSsoSession(opts)
   validateOptions(opts)
 
   const isShareLinkMode = opts.opShareLink !== null
@@ -300,7 +348,7 @@ function renderHelp(defaults: Options): string {
     '',
     'Required:',
     '  --profile <name>                    AWS profile to export                     [env: AWS_SSO_PROFILE]',
-    '  --sso-session <name>                AWS SSO session name                      [env: AWS_SSO_SESSION]',
+    '  --sso-session <name|url>            AWS SSO session name or start URL         [env: AWS_SSO_SESSION]',
     '',
     '1Password mode (use exactly one):',
     '  --op-item <itemNameOrId>            1Password item (requires `op` CLI)        [env: OP_ITEM]',
@@ -343,29 +391,74 @@ function ensureBinary(binary: string): void {
   }
 }
 
+async function newStealthContext(browser: Browser) {
+  const context = await browser.newContext({
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    viewport: { width: 1280, height: 720 },
+    locale: 'en-US',
+  })
+  await context.grantPermissions(['clipboard-read', 'clipboard-write'])
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false })
+  })
+  return context
+}
+
+async function takeDebugScreenshot(page: Page, label: string): Promise<void> {
+  try {
+    const dir = 'screenshots'
+    const { mkdirSync } = await import('node:fs')
+    mkdirSync(dir, { recursive: true })
+    const ts = new Date().toISOString().replace(/[:.]/g, '-')
+    const path = `${dir}/${label}-${ts}.png`
+    await page.screenshot({ path })
+    process.stderr.write(`[share-link] debug screenshot saved: ${path}\n`)
+  } catch (e) {
+    process.stderr.write(`[share-link] failed to save screenshot: ${e}\n`)
+  }
+}
+
+async function copyFieldValue(page: Page, fieldLabel: string): Promise<string> {
+  const label = page.getByText(fieldLabel, { exact: true }).first()
+  // Navigate up to the field container, then find the Copy button
+  const fieldContainer = label.locator('xpath=ancestor::div[contains(@class, "_field")]').first()
+  const copyButton = fieldContainer.locator('button:has-text("Copy")').first()
+
+  await copyButton.click({ timeout: 5_000 })
+  // Small delay for clipboard to populate
+  await page.waitForTimeout(100)
+
+  const value = await page.evaluate(() => navigator.clipboard.readText())
+  return value.trim()
+}
 
 async function getShareLinkSecrets(
   shareUrl: string,
   browser: Browser,
 ): Promise<{ secrets: LoginSecrets; cleanup: () => Promise<void> }> {
-  const context = await browser.newContext()
+  const context = await newStealthContext(browser)
   const page = await context.newPage()
 
-  await page.goto(shareUrl, { waitUntil: 'networkidle', timeout: 30_000 })
+  // Phase 1: Navigate
+  process.stderr.write('[share-link] navigating to share URL\n')
+  await page.goto(shareUrl, { waitUntil: 'domcontentloaded', timeout: 30_000 })
 
-  // Wait for the SPA to decrypt and render fields
-  const deadline = Date.now() + 30_000
-  let fields: { username: string; password: string } | null = null
+  // Phase 2: Wait for page readiness
+  process.stderr.write('[share-link] waiting for fields to render\n')
+  const readinessDeadline = Date.now() + 30_000
 
-  while (Date.now() < deadline) {
+  while (Date.now() < readinessDeadline) {
     // Check for error states
     const pageText = await page.innerText('body').catch(() => '')
     const lowerText = pageText.toLowerCase()
     if (lowerText.includes('expired') || lowerText.includes('no longer available')) {
+      await takeDebugScreenshot(page, 'expired')
       await context.close()
       throw new Error('1Password share link has expired or is no longer available')
     }
     if (lowerText.includes('enter your email') || lowerText.includes('verify your email')) {
+      await takeDebugScreenshot(page, 'email-verification')
       await context.close()
       throw new Error(
         '1Password share link requires email verification. ' +
@@ -373,115 +466,170 @@ async function getShareLinkSecrets(
       )
     }
 
-    fields = await page.evaluate(() => {
-      // Walk the DOM looking for label-value pairs
-      const getText = (el: Element): string => el.textContent?.trim() ?? ''
+    // Check if field labels are visible
+    const usernameVisible = await page
+      .getByText(/^username$/i)
+      .first()
+      .isVisible()
+      .catch(() => false)
+    const passwordVisible = await page
+      .getByText(/^password$/i)
+      .first()
+      .isVisible()
+      .catch(() => false)
 
-      // Strategy: find all elements that look like field containers
-      // 1Password share pages render fields as label + value pairs
-      let username = ''
-      let password = ''
-
-      // Look for elements with specific data attributes or class patterns
-      const allElements = document.querySelectorAll('*')
-      const labelValuePairs: { label: string; value: string }[] = []
-
-      for (const el of allElements) {
-        const text = getText(el)
-        // Skip elements with too much text (they're containers)
-        if (text.length > 500 || text.length === 0) continue
-
-        const lowerText = text.toLowerCase()
-        // Look for labels
-        if (
-          (lowerText === 'username' || lowerText === 'email' || lowerText === 'password') &&
-          el.nextElementSibling
-        ) {
-          const valueText = getText(el.nextElementSibling)
-          if (valueText.length > 0 && valueText.length < 300) {
-            labelValuePairs.push({ label: lowerText, value: valueText })
-          }
-        }
-      }
-
-      for (const pair of labelValuePairs) {
-        if ((pair.label === 'username' || pair.label === 'email') && !username) {
-          username = pair.value
-        }
-        if (pair.label === 'password' && !password) {
-          password = pair.value
-        }
-      }
-
-      // Fallback: look for input elements with values
-      if (!username) {
-        const inputs = document.querySelectorAll('input[type="text"], input[type="email"]')
-        for (const input of inputs) {
-          const val = (input as HTMLInputElement).value
-          if (val && val.includes('@')) {
-            username = val
-            break
-          }
-        }
-      }
-
-      if (!username || !password) return null
-      return { username, password }
-    }).catch(() => null)
-
-    if (fields) break
-
-    // Try clicking "Reveal" buttons to expose hidden password
-    const revealBtn = page.locator('button:has-text("Reveal"), button:has-text("Show"), [aria-label*="reveal" i], [aria-label*="show" i]').first()
-    const revealVisible = await revealBtn.isVisible().catch(() => false)
-    if (revealVisible) {
-      await revealBtn.click({ timeout: 2_000 }).catch(() => {})
-      await page.waitForTimeout(500)
-      continue
+    if (usernameVisible && passwordVisible) {
+      process.stderr.write('[share-link] fields are visible\n')
+      break
     }
 
     await page.waitForTimeout(1_000)
   }
 
-  if (!fields) {
-    const preview = await page.innerText('body').catch(() => '').then((t) => t.slice(0, 500))
+  if (Date.now() >= readinessDeadline) {
+    const bodyLen = await page.innerText('body').catch(() => '').then((t) => t.length)
+    process.stderr.write(`[share-link] readiness timeout, body text length: ${bodyLen}\n`)
+    await takeDebugScreenshot(page, 'readiness-timeout')
     await context.close()
     throw new Error(
-      `Failed to scrape credentials from 1Password share page.\n\nPage content preview:\n${preview}`,
+      'Timed out waiting for 1Password share page to render fields. ' +
+      'The page may be blank due to headless browser detection. Try --headed for debugging.',
     )
   }
 
-  process.stderr.write(`[share-link] scraped username: ${fields.username}\n`)
+  // Phase 3: Extract username via Copy button
+  process.stderr.write('[share-link] extracting username via clipboard\n')
+  let username: string
+  try {
+    username = await copyFieldValue(page, 'username')
+  } catch {
+    // Fallback: try DOM text extraction for username (it's visible, not masked)
+    process.stderr.write('[share-link] clipboard failed for username, trying DOM fallback\n')
+    try {
+      username = await page.evaluate(() => {
+        const labels = Array.from(document.querySelectorAll('*'))
+        for (const el of labels) {
+          if (
+            el.children.length === 0 &&
+            el.textContent?.trim().toLowerCase() === 'username'
+          ) {
+            // Walk up to find the field container, then find the value sibling
+            let container = el.parentElement
+            for (let depth = 0; depth < 4 && container; depth++) {
+              const valueEl = container.querySelector('[class*="_value"]')
+              if (valueEl) {
+                const text = valueEl.textContent?.trim() ?? ''
+                if (text.length > 0 && !text.includes('•')) return text
+              }
+              container = container.parentElement
+            }
+          }
+        }
+        return null
+      })
+      if (!username) throw new Error('DOM fallback found no username')
+    } catch (e) {
+      await takeDebugScreenshot(page, 'username-extraction-failed')
+      await context.close()
+      throw new Error(`Failed to extract username from 1Password share page: ${e}`)
+    }
+  }
+  process.stderr.write(`[share-link] extracted username: ${username}\n`)
+
+  // Phase 4: Extract password via Copy button
+  process.stderr.write('[share-link] extracting password via clipboard\n')
+  let password: string
+  try {
+    password = await copyFieldValue(page, 'password')
+  } catch (e) {
+    await takeDebugScreenshot(page, 'password-extraction-failed')
+    await context.close()
+    throw new Error(
+      `Failed to extract password from 1Password share page: ${e}\n` +
+      'The password is masked with dots and can only be extracted via the Copy button.',
+    )
+  }
+  process.stderr.write('[share-link] extracted password\n')
+
+  // Phase 5: Set up live OTP reader with caching
+  process.stderr.write('[share-link] setting up OTP reader\n')
+  let otpCache: { otp: string; fetchedAtMs: number } | null = null
 
   const getOtp = async (): Promise<string> => {
-    // Read the live rotating TOTP code from the still-open page
-    const otp = await page.evaluate(() => {
-      // Look for elements containing exactly 6 digits (TOTP codes)
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
-      let node: Text | null
-      while ((node = walker.nextNode() as Text | null)) {
-        const text = node.textContent?.trim() ?? ''
-        // Match 6-digit codes, possibly with spaces (e.g. "123 456")
-        const digits = text.replace(/\s/g, '')
-        if (/^\d{6}$/.test(digits)) {
-          return digits
-        }
+    const now = Date.now()
+    if (otpCache !== null && now - otpCache.fetchedAtMs < 5_000) {
+      return otpCache.otp
+    }
+
+    // Primary: use Copy button on the one-time password field
+    let otp: string | null = null
+    try {
+      otp = await copyFieldValue(page, 'one-time password')
+      // Validate it looks like a TOTP code (6+ digits)
+      const digits = otp.replace(/\s/g, '')
+      if (!/^\d{6,10}$/.test(digits)) {
+        otp = null
+      } else {
+        otp = digits
       }
-      return null
-    }).catch(() => null)
+    } catch {
+      // Fallback: parse TOTP from DOM spans
+    }
 
     if (!otp) {
+      otp = await page.evaluate(() => {
+        // Find the "one-time password" label via text content (no CSS class dependency)
+        const allElements = Array.from(document.querySelectorAll('*'))
+        let labelEl: Element | null = null
+        for (const el of allElements) {
+          if (
+            el.children.length === 0 &&
+            el.textContent?.trim().toLowerCase() === 'one-time password'
+          ) {
+            labelEl = el
+            break
+          }
+        }
+
+        if (!labelEl) return null
+
+        // Walk up to find a container with 3-digit spans
+        let container = labelEl.parentElement
+        for (let depth = 0; depth < 5 && container; depth++) {
+          const spans = Array.from(container.querySelectorAll('span'))
+          const digitGroups: string[] = []
+          for (const span of spans) {
+            const spanText = span.textContent?.trim() ?? ''
+            if (/^\d{3}$/.test(spanText)) {
+              digitGroups.push(spanText)
+            }
+          }
+          if (digitGroups.length >= 2) {
+            return digitGroups[0]! + digitGroups[1]!
+          }
+          container = container.parentElement
+        }
+
+        return null
+      }).catch(() => null)
+    }
+
+    if (!otp) {
+      await takeDebugScreenshot(page, 'otp-extraction-failed')
       throw new Error('Failed to read TOTP code from 1Password share page')
     }
+
+    otpCache = { otp, fetchedAtMs: now }
     return otp
   }
 
-  // Verify we can read an OTP
+  // Phase 6: Verify OTP is readable
   await getOtp()
   process.stderr.write('[share-link] verified TOTP code readable\n')
 
+  // Phase 7: Return secrets + cleanup
   return {
-    secrets: { username: fields.username, password: fields.password, getOtp },
+    secrets: { username, password, getOtp },
     cleanup: async () => { await context.close() },
   }
 }
@@ -717,22 +865,38 @@ async function authorizeAwsDeviceWithBrowser(
     await page.locator('input, button').first().waitFor({ timeout: 15_000 }).catch(() => {})
 
     const deadline = Date.now() + opts.automationTimeoutMs
+    let iteration = 0
     while (Date.now() < deadline) {
+      iteration++
+      const url = page.url()
+      if (iteration <= 5 || iteration % 10 === 0) {
+        const title = await page.title().catch(() => '?')
+        process.stderr.write(`[auth] iteration=${iteration} url=${url} title=${title}\n`)
+      }
+
       if (await looksAuthorized(page)) {
+        process.stderr.write('[auth] authorized!\n')
         return
       }
 
       await dismissCookieBanner(page)
 
-      const didSomething =
-        (await handleUsername(page, secrets.username)) ||
-        (await handlePassword(page, secrets.password)) ||
-        (await handleOtp(page, secrets.getOtp)) ||
-        (await handleAllow(page))
+      const filledUsername = await handleUsername(page, secrets.username)
+      if (filledUsername) process.stderr.write('[auth] filled username\n')
+      const filledPassword = !filledUsername && await handlePassword(page, secrets.password)
+      if (filledPassword) process.stderr.write('[auth] filled password\n')
+      const filledOtp = !filledUsername && !filledPassword && await handleOtp(page, secrets.getOtp)
+      if (filledOtp) process.stderr.write('[auth] filled OTP\n')
+      const clickedAllow = !filledUsername && !filledPassword && !filledOtp && await handleAllow(page)
+      if (clickedAllow) process.stderr.write('[auth] clicked allow\n')
 
+      const didSomething = filledUsername || filledPassword || filledOtp || clickedAllow
       await page.waitForTimeout(didSomething ? 350 : 700)
     }
 
+    const finalUrl = page.url()
+    const finalText = await page.innerText('body').catch(() => '').then(t => t.slice(0, 500))
+    process.stderr.write(`[auth] TIMEOUT url=${finalUrl}\n[auth] page text: ${finalText}\n`)
     throw new Error('Timed out waiting for device authorization')
   } finally {
     await page.close()
